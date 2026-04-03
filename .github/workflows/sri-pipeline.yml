@@ -1,0 +1,84 @@
+on:
+ push:
+ branches: [dev, qa, staging, master]
+env:
+ IMAGE_TAG: ${{ github.sha }}
+ ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+ ECR_REPO: ${{ secrets.ECR_REPO_NAME }}
+ ENVIRONMENT: ${{ github.ref_name == 'master' && 'prod' || github.ref_name }}
+jobs:
+ sonarqube-scan:
+ name: SonarQube Static Analysis
+ runs-on: ubuntu-latest
+ steps:
+ - uses: actions/checkout@v4
+ with: { fetch-depth: 0 }
+ - uses: SonarSource/sonarqube-scan-action@master
+ env:
+ SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+ SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+ - uses: SonarSource/sonarqube-quality-gate-action@master
+ timeout-minutes: 5
+ env: { SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }} }
+ build-scan-push:
+ name: Docker Build + Trivy Scan + ECR Push
+ needs: sonarqube-scan
+ runs-on: ubuntu-latest
+ steps:
+ - uses: actions/checkout@v4
+ - uses: aws-actions/configure-aws-credentials@v4
+ with:
+ aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+ aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+ aws-region: ap-south-1
+ - uses: aws-actions/amazon-ecr-login@v2
+ - name: Build Docker image
+ run: docker build -t $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG .
+ - name: Trivy scan — block on CRITICAL
+ uses: aquasecurity/trivy-action@master
+ with:
+ image-ref: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG
+}}
+ exit-code: '1'
+ severity: 'CRITICAL'
+ - name: Push to ECR
+ run: docker push $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG
+ update-manifests:
+ name: Update image tag in k8s-manifests repo
+ needs: build-scan-push
+ runs-on: ubuntu-latest
+ steps:
+ - uses: actions/checkout@v4
+ with:
+ repository: sri-karthik/k8s-manifests
+ token: ${{ secrets.MANIFESTS_REPO_TOKEN }}
+ ref: ${{ env.ENVIRONMENT }}
+ - name: Update image tag
+ run: |
+ sed -i "s|image:.*sri-ecr-repo:.*|image:
+$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG|" environments/$ENVIRONMENT/deployment.yaml
+ git config user.email 'ci@sri-app.io'
+ git config user.name 'Sri CI Bot'
+ git add . && git commit -m 'ci: deploy ${{ env.IMAGE_TAG }}' && git push
+ notify:
+ name: Slack Notification
+ needs: [update-manifests]
+ if: always()
+ runs-on: ubuntu-latest
+ steps:
+ - name: Notify Success
+ if: ${{ needs.update-manifests.result == 'success' }}
+ uses: slackapi/slack-github-action@v1.26.0
+ with:
+ channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+ slack-message: ':white_check_mark: *DEPLOYED* | ${{ env.ENVIRONMENT }} |
+${{ env.IMAGE_TAG }}'
+ env: { SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }} }
+ - name: Notify Failure
+ if: ${{ needs.update-manifests.result != 'success' }}
+ uses: slackapi/slack-github-action@v1.26.0
+ with:
+ channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+ slack-message: ':x: *FAILED* | ${{ env.ENVIRONMENT }} | check Actions
+logs'
+ env: { SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }} }
